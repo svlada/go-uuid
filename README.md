@@ -15,7 +15,7 @@ package main
 import (
 "fmt"
 "log"
-"svlada.com/uuidgenerator/v1"
+"svlada.com/uuid/v1"
 )
 
 func main() {
