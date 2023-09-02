@@ -1,16 +1,29 @@
 package v1
 
 import (
-	"svlada.com/uuid"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"sync"
 	time "time"
+
+	"svlada.com/uuid"
 )
+
+func init() {
+	gob.Register(UUIDGeneratorState{})
+	fileStrategy := &FilePersistence{Filename: "uuid_state.bin"}
+	var err error
+	g, err = NewUUIDGenerator(fileStrategy)
+	if err != nil {
+		panic("Failed to initialize UUID generator: " + err.Error())
+	}
+}
 
 type ClockSequence uint16
 
@@ -19,20 +32,20 @@ func (cs *ClockSequence) Increment() {
 	*cs = (*cs + 1) & 0x3FFF
 }
 
-var clockSequence ClockSequence
-var clockMutex sync.Mutex
-var lastTimestamp time.Time
-
-func init() {
-	randClockSeq, err := rand.Int(rand.Reader, big.NewInt(1<<14))
-	if err != nil {
-		panic("Could not initialize clock sequence: " + err.Error())
-	}
-	clockSequence = ClockSequence(randClockSeq.Int64())
+type UUIDGenerator struct {
+	State       UUIDGeneratorState
+	Mu          sync.Mutex
+	Persistence StateStore
 }
 
-func UUIDv1() (uuid.UUID, error) {
-	var uuid uuid.UUID
+type UUIDGeneratorState struct {
+	ClockSeq ClockSequence
+	LastTime time.Time
+	Node     []byte
+}
+
+func (gen *UUIDGenerator) Generate() (uuid.UUID, error) {
+	var uuidValue uuid.UUID
 
 	timestamp := time.Now().UnixNano()/100 + 122192928000000000
 	timeLow := uint32(timestamp & 0xFFFFFFFF)
@@ -40,35 +53,81 @@ func UUIDv1() (uuid.UUID, error) {
 	timeHiAndVersion := uint16((timestamp >> 48) & 0x0FFF)
 	timeHiAndVersion |= 0x1000
 
-	binary.BigEndian.PutUint32(uuid[0:], timeLow)
-	binary.BigEndian.PutUint16(uuid[4:], timeMid)
-	binary.BigEndian.PutUint16(uuid[6:], timeHiAndVersion)
+	binary.BigEndian.PutUint32(uuidValue[0:], timeLow)
+	binary.BigEndian.PutUint16(uuidValue[4:], timeMid)
+	binary.BigEndian.PutUint16(uuidValue[6:], timeHiAndVersion)
 
-	clockMutex.Lock()
-	defer clockMutex.Unlock()
+	gen.Mu.Lock()
+	defer gen.Mu.Unlock()
 
 	currentTime := time.Now()
-	if currentTime.Before(lastTimestamp) || currentTime.Equal(lastTimestamp) {
-		clockSequence.Increment()
+	if currentTime.Before(gen.State.LastTime) || currentTime.Equal(gen.State.LastTime) {
+		gen.State.ClockSeq.Increment()
 	}
 
-	clockSeqLow := uint8(clockSequence & 0xFF)
-	clockSeqHi := uint8((clockSequence >> 8) & 0x3F)
+	clockSeqLow := uint8(gen.State.ClockSeq & 0xFF)
+	clockSeqHi := uint8((gen.State.ClockSeq >> 8) & 0x3F)
 	clockSeqHi |= 0x80
-	binary.BigEndian.PutUint16(uuid[8:10], uint16(clockSeqHi)<<8|uint16(clockSeqLow))
+	binary.BigEndian.PutUint16(uuidValue[8:10], uint16(clockSeqHi)<<8|uint16(clockSeqLow))
 
 	node, err := getHardwareAddr()
 	if err != nil {
 		fmt.Println("Could not get MAC address:", err)
 		node = make([]byte, 6)
 		if _, randErr := rand.Read(node); randErr != nil {
-			return uuid, randErr
+			return uuidValue, randErr
 		}
 	}
 
-	copy(uuid[10:], node)
+	copy(uuidValue[10:], node)
 
-	return uuid, nil
+	if fileErr := gen.Persistence.Save(&gen.State); err != nil {
+		return uuidValue, fmt.Errorf("error saving generator state: %w", fileErr)
+	}
+
+	return uuidValue, nil
+}
+
+var g *UUIDGenerator
+
+func UUIDv1() (uuid.UUID, error) {
+	return g.Generate()
+}
+
+type StateStore interface {
+	Load() (*UUIDGeneratorState, error)
+	Save(*UUIDGeneratorState) error
+}
+
+func NewUUIDGenerator(store StateStore) (*UUIDGenerator, error) {
+	state, err := store.Load()
+	if err != nil {
+		randClockSeq, err := rand.Int(rand.Reader, big.NewInt(1<<14))
+		if err != nil {
+			panic("Could not initialize clock sequence: " + err.Error())
+		}
+
+		node, nodeErr := getHardwareAddr()
+		if nodeErr != nil {
+			return nil, nodeErr
+		}
+
+		state = &UUIDGeneratorState{
+			ClockSeq: ClockSequence(randClockSeq.Int64()),
+			Node:     node,
+			LastTime: time.Now(),
+		}
+
+		err = store.Save(state)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &UUIDGenerator{
+		State:       *state,
+		Persistence: store,
+	}, nil
 }
 
 func getHardwareAddr() ([]byte, error) {
@@ -86,4 +145,42 @@ func getHardwareAddr() ([]byte, error) {
 		}
 	}
 	return nil, errors.New("could not find a suitable MAC address")
+}
+
+type FilePersistence struct {
+	Filename string
+}
+
+func (fp *FilePersistence) Load() (*UUIDGeneratorState, error) {
+	file, err := os.Open(fp.Filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &UUIDGeneratorState{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	decoder := gob.NewDecoder(file)
+	state := &UUIDGeneratorState{}
+	if err := decoder.Decode(state); err != nil {
+		return nil, err
+	}
+
+	return state, nil
+}
+
+func (fp *FilePersistence) Save(state *UUIDGeneratorState) error {
+	file, err := os.Create(fp.Filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := gob.NewEncoder(file)
+	if err := encoder.Encode(state); err != nil {
+		return err
+	}
+
+	return nil
 }
