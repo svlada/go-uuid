@@ -1,5 +1,4 @@
 # UUID
-bit+build series: Write an UUID library in Go.
 
 The RFC4122 specifies seven variants of UUID ([New UUID Formats](https://uuid6.github.io/uuid6-ietf-draft/)).:
 * **Version 1:** Time-based UUID.
